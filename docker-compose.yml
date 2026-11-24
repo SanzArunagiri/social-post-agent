@@ -1,0 +1,13 @@
+services:
+  social-post-agent:
+    build: .
+    image: social-post-agent:local
+    env_file: .env
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - agent-data:/data          # SQLite database + media files
+    restart: unless-stopped
+
+volumes:
+  agent-data:
