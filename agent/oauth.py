@@ -71,7 +71,9 @@ async def take_token(kind: str, tok: str) -> dict | None:
         r = (await c.execute(select(db.tokens).where(db.tokens.c.id == h, db.tokens.c.kind == kind))).first()
         if not r:
             return None
-        await c.execute(delete(db.tokens).where(db.tokens.c.id == h))
+        # the delete decides who wins if two requests race with the same token
+        if not (await c.execute(delete(db.tokens).where(db.tokens.c.id == h))).rowcount:
+            return None
     if r.expires < time.time():
         return None
     return crypto.decrypt_json(r.data)

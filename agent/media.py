@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import mimetypes
 import re
 import secrets
 import time
@@ -21,7 +20,7 @@ from sqlalchemy import delete, insert, select, update
 
 from . import crypto, db
 from .config import settings
-from .net import check_public_url, client, drive_direct
+from .net import client, drive_direct, pinned_request
 
 log = logging.getLogger("agent.media")
 ID_RX = re.compile(r"^[0-9a-f]{32}$")
@@ -60,6 +59,7 @@ def sniff(head: bytes) -> str:
     return ""
 
 
+ALLOWED = {"image/jpeg", "image/png", "image/gif", "image/webp", "video/mp4", "video/quicktime", "video/webm"}
 EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp", "image/heic": ".heic",
        "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm"}
 
@@ -90,11 +90,13 @@ def _finalise_type(tmp: Path, filename: str, mime: str) -> tuple[str, str]:
     with open(tmp, "rb") as f:
         head = f.read(32)
     real = sniff(head)
-    mime = real or (mime or "").split(";")[0].strip().lower() or mimetypes.guess_type(filename or "")[0] or ""
-    if not mime.startswith(("image/", "video/")):
-        raise ValueError("Only images and videos can be uploaded")
-    ext = EXT.get(mime) or Path(filename or "").suffix.lower()[:8] or mimetypes.guess_extension(mime) or ""
-    return mime, ext
+    # The type always comes from the bytes, never from the name or the declared type: files are served
+    # publicly from this origin, so e.g. an SVG or HTML file must never get in.
+    if real == "image/heic":
+        raise ValueError("HEIC images aren't accepted by the platforms - convert to JPEG")
+    if real not in ALLOWED:
+        raise ValueError("Only JPEG, PNG, GIF, WebP images and MP4, MOV, WebM videos can be uploaded")
+    return real, EXT[real]
 
 
 async def save_file(tmp: Path, filename: str, mime: str = "") -> dict:
@@ -152,10 +154,10 @@ async def import_url(url: str) -> dict:
     try:
         async with client(300, follow_redirects=False) as c:
             for _ in range(6):                               # follow redirects ourselves, checking each hop
-                await check_public_url(url)
-                async with c.stream("GET", url) as r:
+                target, headers, ext = await pinned_request(url)
+                async with c.stream("GET", target, headers=headers, extensions=ext) as r:
                     if r.is_redirect and r.headers.get("location"):
-                        url = str(r.url.join(r.headers["location"]))
+                        url = str(httpx.URL(url).join(r.headers["location"]))
                         continue
                     if r.status_code >= 300:
                         raise ValueError(f"Couldn't download the media ({r.status_code} from {r.url.host})")

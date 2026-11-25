@@ -211,7 +211,7 @@ async def test_chunked_base64_upload(env):
 
 
 async def test_rejects_non_media(env):
-    with pytest.raises(ValueError, match="Only images and videos"):
+    with pytest.raises(ValueError, match="Only JPEG, PNG"):
         await media.save_bytes(b"%PDF-1.4 hello", "doc.pdf")
 
 

@@ -22,7 +22,7 @@ def result_page(title: str, message: str, ok: bool, items: list[str] | None = No
             f"<p>{html.escape(message)}</p><div>{lis}</div></div>")
 
 
-def upload_page(note: str, max_files: int) -> str:
+def upload_page(note: str, max_files: int, nonce: str) -> str:
     # JSON inside <script>: escape <, > and & so a note can never close the script tag
     note_js = json.dumps(note or "Images and videos for your post").replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     return """<!DOCTYPE html><meta name=viewport content='width=device-width,initial-scale=1'>
@@ -31,7 +31,7 @@ def upload_page(note: str, max_files: int) -> str:
 <label id=drop>Tap to choose images / videos, or drop them here
 <input id=f type=file multiple accept="image/*,video/*" hidden></label>
 <div id=out></div><p id=done class=ok hidden>Done - you can close this page and tell your assistant the files are uploaded.</p></div>
-<script>
+""" + f'<script nonce="{html.escape(nonce)}">' + """
 const MAX=""" + str(int(max_files)) + """, out=document.getElementById("out"), drop=document.getElementById("drop");
 document.getElementById("note").textContent=""" + note_js + """;
 async function send(files){

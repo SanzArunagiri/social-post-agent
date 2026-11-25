@@ -47,7 +47,7 @@ sed -i "s|^API_KEY=.*|API_KEY=$(openssl rand -hex 32)|" .env
 sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=$(openssl rand -hex 32)|" .env
 sed -i "s|^PUBLIC_URL=.*|PUBLIC_URL=https://social.example.com|" .env     # your address
 
-docker compose up -d
+docker compose up -d                            # listens on 127.0.0.1:8000 - point your https proxy there
 curl https://social.example.com/health          # {"ok":true,...}
 ```
 
@@ -286,7 +286,7 @@ Post status: `draft → scheduled → posting → posted | partial | failed`, or
 `partial` / `failed` post again retries only the targets that failed. A post interrupted by a restart
 is marked failed for the remaining targets (check the platform before retrying).
 
-**Media.** Images and videos are stored under `/data/media` (the real type is read from the file's first bytes, so a PNG named `.jpg` is caught before Instagram rejects it) and served at
+**Media.** JPEG, PNG, GIF, WebP, MP4, MOV and WebM files are stored under `/data/media`. The real type is read from the file's first bytes, so a PNG named `.jpg` is caught before Instagram rejects it. Files are served at
 `<PUBLIC_URL>/media/<128-bit random id>.<ext>` (public, so platforms can fetch them; range requests
 supported). A file is deleted `MEDIA_DELETE_AFTER_MINUTES` after **every post that uses it is posted on
 every platform**. Drafts, scheduled, partial and failed posts keep their files (cancel a post to release
@@ -312,15 +312,27 @@ All platform limits checked before posting live in `agent/limits.py`.
 - Every endpoint needs the API key (`Authorization: Bearer` or `X-API-Key`, compared in constant time)
   except: `/health`, the OAuth callbacks, `/media/<random id>`, one-time upload pages `/u/<token>` and
   one-time connect links `/connect/<platform>?t=<token>`.
-- Failed authentication is rate-limited per IP (30/min); upload pages are rate-limited per IP and per
-  link (`UPLOAD_RATE_PER_MINUTE`) and capped at `UPLOAD_LINK_MAX_FILES` files; links expire.
+- Request bodies are capped before anything reads them: 16 MB for JSON / MCP calls, `MEDIA_MAX_MB`
+  for file uploads, 64 KB for the Meta callbacks. Upload links are checked (valid, not expired, not
+  full, under the rate limit) before the upload body is read.
+- Failed authentication is rate-limited per IP (30/min). Upload pages are rate-limited per IP and per
+  link (`UPLOAD_RATE_PER_MINUTE`) and capped at `UPLOAD_LINK_MAX_FILES` files, and links expire.
+- Only JPEG, PNG, GIF, WebP, MP4, MOV and WebM files are stored. The type is read from the file's
+  bytes, never from its name or declared type, so SVG / HTML can't be planted on this origin. Media is
+  served with `Content-Security-Policy: sandbox` and `nosniff`. The HTML pages carry a strict CSP
+  (nonce-based script, no framing).
+- Media links fetched for you go through an SSRF guard. Only globally routable addresses are allowed
+  (no private, loopback, link-local / cloud-metadata or CGNAT ranges). The checked address is pinned
+  for the connection, so a DNS rebind can't redirect it, and every redirect hop is checked again.
 - Platform tokens are encrypted at rest (Fernet, key derived from `ENCRYPTION_KEY`) and never returned
-  by the API. One-time tokens are stored as SHA-256 hashes.
+  by the API. One-time tokens are stored as SHA-256 hashes, and each works exactly once even under
+  concurrent use.
 - Logs never contain secrets: access tokens, `Authorization` headers, one-time tokens and every secret
-  from `.env` are redacted; httpx request logging is off.
-- Media links fetched for you go through an SSRF guard (public addresses only, every redirect checked).
-- Behind a reverse proxy, set `FORWARDED_ALLOW_IPS` so per-IP limits see the real client address.
-- Anyone with the API key can post as you — keep it secret and rotate it if leaked.
+  from `.env` are redacted, and httpx request logging is off.
+- `docker-compose.yml` publishes the port on `127.0.0.1` only. Put an https reverse proxy in front.
+  If you expose the port directly, set `FORWARDED_ALLOW_IPS=127.0.0.1` so clients can't spoof
+  `X-Forwarded-For` to dodge the per-IP limits.
+- Anyone with the API key can post as you. Keep it secret and rotate it if it leaks.
 
 ## Configuration
 

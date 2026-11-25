@@ -56,27 +56,39 @@ def _message(d: dict) -> str:
 
 # ------------------------------------------------------------------ SSRF guard
 
-def _check_host(url: str) -> None:
+def _public_ip(host: str, port: int) -> str:
+    """Resolve host and return one address, refusing if ANY address isn't globally routable
+    (private, loopback, link-local / cloud metadata, CGNAT, reserved, multicast...)."""
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Can't resolve {host}") from exc
+    ips = [ipaddress.ip_address(i[4][0]) for i in infos]
+    for ip in ips:
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if not ip.is_global or ip.is_multicast or (mapped is not None and not mapped.is_global):
+            raise ValueError(f"{host} points to an internal address - not allowed")
+    if not ips:
+        raise ValueError(f"Can't resolve {host}")
+    return str(ips[0])
+
+
+async def pinned_request(url: str) -> tuple[str, dict, dict]:
+    """Check a user-supplied URL and pin it to the checked address, so a DNS answer that changes
+    between the check and the connection (DNS rebinding) can't reach an internal host.
+    Returns (url to request, extra headers, httpx extensions)."""
     u = urlparse(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("Only public http(s) links can be used")
-    try:
-        infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80))
-    except socket.gaierror as exc:
-        raise ValueError(f"Can't resolve {u.hostname}") from exc
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
-                or ip.is_unspecified or getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped.is_private):
-            raise ValueError(f"{u.hostname} points to an internal address - not allowed")
-
-
-async def check_public_url(url: str) -> None:
-    if transport is not None:                    # tests: no DNS
-        if urlparse(url).scheme not in ("http", "https"):
-            raise ValueError("Only public http(s) links can be used")
-        return
-    await asyncio.to_thread(_check_host, url)
+    if transport is not None:                     # tests: mocked network, no DNS
+        return url, {}, {}
+    port = u.port or (443 if u.scheme == "https" else 80)
+    ip = await asyncio.to_thread(_public_ip, u.hostname, port)
+    host = f"[{ip}]" if ":" in ip else ip
+    netloc = f"{host}:{u.port}" if u.port else host
+    pinned = u._replace(netloc=netloc).geturl()
+    host_header = u.hostname + (f":{u.port}" if u.port else "")
+    return pinned, {"Host": host_header}, ({"sni_hostname": u.hostname} if u.scheme == "https" else {})
 
 
 def drive_direct(url: str) -> str:

@@ -117,7 +117,7 @@ class AuthMiddleware:
             scope = {**scope, "path": "/mcp", "raw_path": b"/mcp"}          # secret-URL MCP access
             return await self.app(scope, receive, send)
         docs = settings.api_docs and path in ("/docs", "/openapi.json", "/docs/oauth2-redirect")
-        if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES) or docs or scope.get("method") == "OPTIONS":
+        if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES) or docs:
             return await self.app(scope, receive, send)
         headers = dict(scope.get("headers") or [])
         if _has_key(headers):
@@ -129,6 +129,83 @@ class AuthMiddleware:
         await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"), (b"www-authenticate", b'Bearer realm="social-post-agent"')]})
         await send({"type": "http.response.body", "body": json.dumps(body).encode()})
+
+
+# ======================================================================= request size limits + security headers
+
+class _TooLarge(Exception):
+    pass
+
+
+def body_limit(path: str) -> int:
+    if path.startswith("/u/") or path == "/api/media":
+        return settings.media_max_mb * 1024 * 1024 + 1024 * 1024        # file + multipart overhead
+    if path.startswith("/callback/"):
+        return 64 * 1024
+    return 16 * 1024 * 1024                                              # JSON (base64 parts for upload_media)
+
+
+class LimitsMiddleware:
+    """Caps request bodies before anything parses or spools them, and adds security headers."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path, limit = scope.get("path", ""), body_limit(scope.get("path", ""))
+        headers = dict(scope.get("headers") or [])
+        try:
+            declared = int(headers.get(b"content-length", b"0") or 0)
+        except ValueError:
+            declared = 0
+        if declared > limit:
+            return await _plain(send, 413, {"error": "Request too large"})
+        seen, started = 0, False
+
+        async def limited_receive():
+            nonlocal seen
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body") or b"")
+                if seen > limit:
+                    raise _TooLarge()
+            return msg
+
+        async def send_with_headers(msg):
+            nonlocal started
+            if msg["type"] == "http.response.start":
+                started = True
+                h = list(msg.get("headers") or [])
+                names = {k.lower() for k, _ in h}
+                for k, v in ((b"x-content-type-options", b"nosniff"), (b"x-frame-options", b"DENY"),
+                             (b"referrer-policy", b"no-referrer")):
+                    if k not in names:
+                        h.append((k, v))
+                if path.startswith("/media/") and b"content-security-policy" not in names:
+                    h.append((b"content-security-policy", b"default-src 'none'; sandbox"))
+                msg = {**msg, "headers": h}
+            await send(msg)
+
+        try:
+            await self.app(scope, limited_receive, send_with_headers)
+        except _TooLarge:
+            if not started:
+                await _plain(send, 413, {"error": "Request too large"})
+
+
+async def _plain(send, status: int, body: dict) -> None:
+    await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": json.dumps(body).encode()})
+
+
+def html_page(content: str, status: int = 200, nonce: str = "") -> HTMLResponse:
+    script = f"script-src 'nonce-{nonce}'; connect-src 'self'; " if nonce else ""
+    csp = (f"default-src 'none'; {script}style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; "
+           "frame-ancestors 'none'; base-uri 'none'")
+    return HTMLResponse(content, status, headers={"Content-Security-Policy": csp, "Cache-Control": "no-store",
+                                                  "Referrer-Policy": "no-referrer"})
 
 
 # ======================================================================= background loops
@@ -179,6 +256,7 @@ def create_app() -> FastAPI:
                   docs_url="/docs" if settings.api_docs else None, redoc_url=None,
                   openapi_url="/openapi.json" if settings.api_docs else None)
     app.add_middleware(AuthMiddleware)
+    app.add_middleware(LimitsMiddleware)          # outermost: size cap applies before auth and parsing
 
 
     @app.exception_handler(ValueError)
@@ -213,11 +291,11 @@ def create_app() -> FastAPI:
         if not _has_key(headers):
             link = await oauth.take_token("connect", t)
             if not link or link.get("provider") != oauth.provider_of(platform):
-                return HTMLResponse(pages.result_page("Link expired", "Ask for a new link with connect_account.", False), 403)
+                return html_page(pages.result_page("Link expired", "Ask for a new link with connect_account.", False), 403)
         try:
             return RedirectResponse(await oauth.authorize_url(platform), status_code=302)
         except ValueError as exc:
-            return HTMLResponse(pages.result_page("Can't connect", str(exc), False), 400)
+            return html_page(pages.result_page("Can't connect", str(exc), False), 400)
 
 
     @app.get("/callback/{provider}")
@@ -226,13 +304,13 @@ def create_app() -> FastAPI:
         if not limiter.allow(f"callback:{client_ip(request)}", 30):
             raise HTTPException(429, "Too many requests")
         if error:
-            return HTMLResponse(pages.result_page("Not connected", error_description or error, False), 400)
+            return html_page(pages.result_page("Not connected", (error_description or error)[:300], False), 400)
         try:
             names = await oauth.finish(provider, code, state)
         except (ValueError, PlatformError) as exc:
             log.warning("OAuth callback for %s failed: %s", provider, exc)
-            return HTMLResponse(pages.result_page("Not connected", redact(str(exc)), False), 400)
-        return HTMLResponse(pages.result_page("Connected", "You can close this page.", True, names))
+            return html_page(pages.result_page("Not connected", redact(str(exc)), False), 400)
+        return html_page(pages.result_page("Connected", "You can close this page.", True, names))
 
 
     @app.post("/callback/{provider}/{event}")
@@ -265,13 +343,14 @@ def create_app() -> FastAPI:
             raise HTTPException(429, "Too many requests")
         link = await media.get_link(tok)
         if not link:
-            return HTMLResponse(pages.result_page("Link expired", "Ask for a new upload link.", False), 410)
-        return HTMLResponse(pages.upload_page(link.get("note") or "", settings.upload_link_max_files),
-                            headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
+            return html_page(pages.result_page("Link expired", "Ask for a new upload link.", False), 410)
+        nonce = crypto.new_token(12)
+        return html_page(pages.upload_page(link.get("note") or "", settings.upload_link_max_files, nonce), nonce=nonce)
 
 
     @app.post("/u/{tok}")
-    async def upload_page_post(tok: str, request: Request, file: UploadFile = File(...)):
+    async def upload_page_post(tok: str, request: Request):
+        # rate limit and token check come first - nothing is read or spooled for a bad / expired link
         ip = client_ip(request)
         if not limiter.allow(f"u-post:{ip}", settings.upload_rate_per_minute) or \
                 not limiter.allow(f"u-tok:{crypto.token_hash(tok)}", settings.upload_rate_per_minute):
@@ -282,12 +361,21 @@ def create_app() -> FastAPI:
         if len(link["media"] or []) >= settings.upload_link_max_files:
             return JSONResponse({"error": f"{settings.upload_link_max_files} files per link"}, status_code=422)
         try:
-            m = await media.save_upload(file)
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=422)
+            form = await request.form(max_files=1, max_fields=2)
+        except Exception:
+            return JSONResponse({"error": "Send one file as multipart form-data (field 'file')"}, status_code=400)
+        try:
+            file = form.get("file")
+            if not hasattr(file, "read"):
+                return JSONResponse({"error": "Send one file as multipart form-data (field 'file')"}, status_code=400)
+            try:
+                m = await media.save_upload(file)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=422)
+        finally:
+            await form.close()
         await media.link_add(tok, m)
         return m
-
 
     # ======================================================================= REST API (API key required)
 
